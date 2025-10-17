@@ -3,8 +3,10 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { authenticateToken, requireRole, requireCompliance, auditLog, asyncHandler } = require('../middleware/auth');
+const onedrive = require('../services/onedrive');
 
 const router = express.Router();
+const storageProvider = process.env.STORAGE_PROVIDER || 'local';
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, '../uploads');
@@ -17,8 +19,42 @@ const policiesDir = path.join(uploadsDir, 'policies');
     }
 });
 
+// Helper to safely resolve stored upload paths (which may start with a leading slash)
+const resolveUploadAbsolute = (storedPath) => {
+    // Normalize and strip any leading slashes/backslashes so join stays relative to backend
+    const normalized = String(storedPath || '')
+        .replace(/^[\\/]+/, '')
+        .replace(/\\/g, '/');
+    return path.join(__dirname, '..', normalized);
+};
+
 // Simple persistence for uploaded files to survive server restarts
 const filesIndexPath = path.join(uploadsDir, 'files-index.json');
+
+// Persisted per-user, per-file view start timestamps
+const ackViewStartsPath = path.join(uploadsDir, 'ack-view-starts.json');
+let ackViewStarts = {};
+
+try {
+    if (fs.existsSync(ackViewStartsPath)) {
+        const loadedViewStarts = JSON.parse(fs.readFileSync(ackViewStartsPath, 'utf-8'));
+        if (loadedViewStarts && typeof loadedViewStarts === 'object') {
+            ackViewStarts = loadedViewStarts;
+        }
+    } else {
+        fs.writeFileSync(ackViewStartsPath, JSON.stringify(ackViewStarts, null, 2));
+    }
+} catch (e) {
+    console.error('Failed to initialize ack view starts store:', e);
+}
+
+const persistAckViewStarts = () => {
+    try {
+        fs.writeFileSync(ackViewStartsPath, JSON.stringify(ackViewStarts, null, 2));
+    } catch (e) {
+        console.error('Failed to persist ack view starts:', e);
+    }
+};
 
 const detectMimeType = (filename) => {
     const ext = path.extname(filename).toLowerCase();
@@ -48,7 +84,8 @@ const buildIndexFromDisk = () => {
                 id: entries.length + 1,
                 originalName: fn,
                 filename: fn,
-                path: `/uploads/${category === 'policy' ? 'policies' : 'system-files'}/${fn}`,
+                // Store without leading slash to avoid Windows path join issues
+                path: `uploads/${category === 'policy' ? 'policies' : 'system-files'}/${fn}`,
                 size: stat.size,
                 mimetype: detectMimeType(fn),
                 category: category,
@@ -64,20 +101,20 @@ const buildIndexFromDisk = () => {
 };
 
 // Configure multer for file uploads
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        // Determine upload directory based on file type or request
-        const uploadPath = req.body.category === 'policy' ? policiesDir : systemFilesDir;
-        cb(null, uploadPath);
-    },
-    filename: function (req, file, cb) {
-        // Generate unique filename with timestamp
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        const ext = path.extname(file.originalname);
-        const name = path.basename(file.originalname, ext);
-        cb(null, name + '-' + uniqueSuffix + ext);
-    }
-});
+const storage = storageProvider === 'onedrive'
+    ? multer.memoryStorage()
+    : multer.diskStorage({
+        destination: function (req, file, cb) {
+            const uploadPath = req.body.category === 'policy' ? policiesDir : systemFilesDir;
+            cb(null, uploadPath);
+        },
+        filename: function (req, file, cb) {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            const ext = path.extname(file.originalname);
+            const name = path.basename(file.originalname, ext);
+            cb(null, name + '-' + uniqueSuffix + ext);
+        }
+    });
 
 const upload = multer({
     storage: storage,
@@ -166,21 +203,76 @@ router.post('/upload', authenticateToken, upload.single('file'), asyncHandler(as
         });
     }
 
-    const newFile = {
-        id: files.length + 1,
-        originalName: req.file.originalname,
-        filename: req.file.filename,
-        path: `/uploads/${req.body.category === 'policy' ? 'policies' : 'system-files'}/${req.file.filename}`,
-        size: req.file.size,
-        mimetype: req.file.mimetype,
-        category: req.body.category || 'system',
-        uploadedBy: req.user.username,
-        uploadedAt: new Date().toISOString(),
-        description: req.body.description || ''
-    };
+    // Allow overriding the display name via body (without needing extension)
+    const ext = path.extname(req.file.originalname);
+    let displayName = (req.body.originalName || req.body.name || req.body.displayName || req.body.customName || '').trim();
+    if (displayName) {
+        // Append original extension if user-provided name lacks one
+        if (!new RegExp(`${ext.replace('.', '\\.')}$`, 'i').test(displayName)) {
+            displayName = `${displayName}${ext}`;
+        }
+        // Sanitize path segments
+        displayName = displayName.replace(/[\\/]/g, '');
+    } else {
+        displayName = req.file.originalname;
+    }
+
+    const ackDelayRaw = parseInt(req.body.ackDelayMinutes, 10);
+    const ackDelayMinutes = Number.isFinite(ackDelayRaw) && ackDelayRaw >= 0 ? ackDelayRaw : 0;
+    const uploadedAtIso = new Date().toISOString();
+
+    const nextId = files.length + 1;
+
+    let newFile;
+    if (storageProvider === 'onedrive') {
+        // Upload directly to OneDrive using in-memory buffer
+        const category = req.body.category === 'policy' ? 'policy' : 'system';
+        const uploaded = await onedrive.uploadFile({
+            buffer: req.file.buffer,
+            contentType: req.file.mimetype,
+            originalName: displayName,
+            id: nextId,
+            category
+        });
+        const storedName = path.basename(uploaded.path);
+        newFile = {
+            id: nextId,
+            originalName: displayName,
+            filename: storedName,
+            path: uploaded.path,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            category,
+            uploadedBy: req.user.username,
+            uploadedAt: uploadedAtIso,
+            description: req.body.description || '',
+            ackDelayMinutes,
+            storageProvider: 'onedrive',
+            onedrive: {
+                driveId: uploaded.driveId,
+                itemId: uploaded.itemId,
+                webUrl: uploaded.webUrl,
+            }
+        };
+    } else {
+        // Local disk storage path
+        const destCategory = /policies\/?$/.test(req.file.destination) ? 'policies' : 'system-files';
+        newFile = {
+            id: nextId,
+            originalName: displayName,
+            filename: req.file.filename,
+            path: `uploads/${destCategory}/${req.file.filename}`,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            category: req.body.category || (destCategory === 'policies' ? 'policy' : 'system'),
+            uploadedBy: req.user.username,
+            uploadedAt: uploadedAtIso,
+            description: req.body.description || '',
+            ackDelayMinutes
+        };
+    }
 
     files.push(newFile);
-    // Persist index after upload
     try {
         fs.writeFileSync(filesIndexPath, JSON.stringify(files, null, 2));
     } catch (e) {
@@ -234,19 +326,34 @@ router.get('/:id/download', authenticateToken, asyncHandler(async (req, res) => 
         });
     }
 
-    const filePath = path.join(__dirname, '..', file.path);
-    
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({
-            success: false,
-            error: 'File not found on disk'
-        });
-    }
-
     // Log the download activity
     auditLog(req.user.id, 'file_download', `Downloaded file: ${file.originalName}`);
 
-    res.download(filePath, file.originalName);
+    if (file.storageProvider === 'onedrive' && file.onedrive && file.onedrive.driveId) {
+        try {
+            const { stream, contentType } = await onedrive.getDownloadStream({
+                driveId: file.onedrive.driveId,
+                itemId: file.onedrive.itemId
+            });
+            res.setHeader('Content-Type', contentType || (file.mimetype || 'application/octet-stream'));
+            res.setHeader('Content-Disposition', `attachment; filename="${file.originalName}"`);
+            stream.pipe(res);
+        } catch (e) {
+            return res.status(500).json({ success: false, error: `OneDrive download failed: ${e.message}` });
+        }
+    } else {
+        let filePath = resolveUploadAbsolute(file.path);
+        if (!fs.existsSync(filePath)) {
+            const altPath = file.path.includes('system-files')
+                ? file.path.replace('system-files', 'policies')
+                : file.path.replace('policies', 'system-files');
+            filePath = resolveUploadAbsolute(altPath);
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ success: false, error: 'File not found on disk' });
+            }
+        }
+        res.download(filePath, file.originalName);
+    }
 }));
 
 // Delete file (compliance users only)
@@ -317,8 +424,13 @@ const authenticateTokenForView = (req, res, next) => {
                 message: 'Invalid or expired token'
             });
         }
+        // Normalize decoded token so routes can consistently use req.user.id
+        const normalizedUser = { ...user };
+        if (!normalizedUser.id && normalizedUser.userId) {
+            normalizedUser.id = normalizedUser.userId;
+        }
 
-        req.user = user;
+        req.user = normalizedUser;
         next();
     });
 };
@@ -335,36 +447,58 @@ router.get('/:id/view', authenticateTokenForView, asyncHandler(async (req, res) 
         });
     }
 
-    const filePath = path.join(__dirname, '..', file.path);
-    
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({
-            success: false,
-            error: 'File not found on disk'
-        });
-    }
-
     // Set appropriate content type for viewing
     const ext = path.extname(file.filename).toLowerCase();
     let contentType = file.mimetype;
-    
-    if (ext === '.pdf') {
-        contentType = 'application/pdf';
-    } else if (ext === '.txt') {
-        contentType = 'text/plain';
-    } else if (ext === '.html' || ext === '.htm') {
-        contentType = 'text/html';
-    }
+    if (ext === '.pdf') contentType = 'application/pdf';
+    else if (ext === '.txt') contentType = 'text/plain';
+    else if (ext === '.html' || ext === '.htm') contentType = 'text/html';
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Disposition', 'inline');
-    // Allow embedding in frontend dev and prod origins via CSP
-    res.setHeader('Content-Security-Policy', "frame-ancestors 'self' http://localhost:3002 http://localhost:3001");
-    
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'self' http://localhost:3001 http://localhost:3002 http://localhost:3003 http://localhost:3004");
+
+    // Record per-user first view start time for ack gating
+    try {
+        const viewerId = (req.user && (req.user.id || req.user.userId)) || null;
+        if (viewerId) {
+            const key = `${viewerId}:${fileId}`;
+            if (!ackViewStarts[key]) {
+                ackViewStarts[key] = new Date().toISOString();
+                persistAckViewStarts();
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to record view start:', e);
+    }
+
     // Log the view activity
     auditLog(req.user.id, 'file_view', `Viewed file: ${file.originalName}`);
 
-    res.sendFile(filePath);
+    if (file.storageProvider === 'onedrive' && file.onedrive && file.onedrive.driveId) {
+        try {
+            const { stream, contentType: dlType } = await onedrive.getDownloadStream({
+                driveId: file.onedrive.driveId,
+                itemId: file.onedrive.itemId
+            });
+            res.setHeader('Content-Type', dlType || contentType);
+            stream.pipe(res);
+        } catch (e) {
+            return res.status(500).json({ success: false, error: `OneDrive view failed: ${e.message}` });
+        }
+    } else {
+        let filePath = resolveUploadAbsolute(file.path);
+        if (!fs.existsSync(filePath)) {
+            const altPath = file.path.includes('system-files')
+                ? file.path.replace('system-files', 'policies')
+                : file.path.replace('policies', 'system-files');
+            filePath = resolveUploadAbsolute(altPath);
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ success: false, error: 'File not found on disk' });
+            }
+        }
+        res.sendFile(filePath);
+    }
 }));
 
 // Acknowledge file
@@ -381,6 +515,38 @@ router.post('/:id/acknowledge', authenticateToken, asyncHandler(async (req, res)
 
     const userId = req.user.id;
     const username = req.body.username || req.user.username;
+
+    // Enforce acknowledgment delay based on the employee's first view time
+    try {
+        const userId = req.user.id;
+        const configuredDelayMs = (file.ackDelayMinutes || 0) * 60 * 1000;
+        const key = `${userId}:${fileId}`;
+        const viewIso = ackViewStarts[key];
+        // Require a view before acknowledging, even if delay is 0
+        if (!viewIso) {
+            return res.status(403).json({
+                success: false,
+                error: 'View required before acknowledgment',
+                remainingMs: configuredDelayMs,
+                allowAt: null
+            });
+        }
+        const viewMs = new Date(viewIso).getTime();
+        const unlockAtMs = viewMs + configuredDelayMs;
+        const nowMs = Date.now();
+        if (Number.isFinite(unlockAtMs) && nowMs < unlockAtMs) {
+            const remainingMs = unlockAtMs - nowMs;
+            return res.status(403).json({
+                success: false,
+                error: 'Acknowledgment not allowed yet',
+                remainingMs,
+                allowAt: new Date(unlockAtMs).toISOString()
+            });
+        }
+    } catch (e) {
+        // If parsing fails, default to allowing acknowledgment
+        console.warn('Failed to evaluate acknowledgment delay, allowing:', e);
+    }
 
     // Check if already acknowledged
     const existingAck = acknowledgments.find(a => a.userId === userId && a.fileId === fileId);
@@ -524,13 +690,36 @@ router.get('/:id/public-view', asyncHandler(async (req, res) => {
             });
         }
 
-        const filePath = path.join(__dirname, '..', file.path);
-        
+        // For OneDrive-backed files, stream via Graph
+        if (file.storageProvider === 'onedrive' && file.onedrive && file.onedrive.driveId) {
+            try {
+                const { stream, contentType: dlType } = await onedrive.getDownloadStream({
+                    driveId: file.onedrive.driveId,
+                    itemId: file.onedrive.itemId
+                });
+                res.setHeader('Content-Type', dlType || (file.mimetype || 'application/octet-stream'));
+                res.setHeader('Content-Disposition', `inline; filename="${file.originalName}"`);
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('Access-Control-Allow-Headers', '*');
+                res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+
+                auditLog(decoded.userId, 'file_public_view', `Public viewed file: ${file.originalName}`);
+                stream.pipe(res);
+                return;
+            } catch (e) {
+                return res.status(500).json({ success: false, message: `OneDrive public view failed: ${e.message}` });
+            }
+        }
+
+        let filePath = resolveUploadAbsolute(file.path);
         if (!fs.existsSync(filePath)) {
-            return res.status(404).json({
-                success: false,
-                error: 'File not found on disk'
-            });
+            const altPath = file.path.includes('system-files')
+                ? file.path.replace('system-files', 'policies')
+                : file.path.replace('policies', 'system-files');
+            filePath = resolveUploadAbsolute(altPath);
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ success: false, error: 'File not found on disk' });
+            }
         }
 
         // Set appropriate content type

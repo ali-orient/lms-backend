@@ -5,26 +5,61 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 const { connectDB } = require('./config/database');
-require('dotenv').config();
+require('dotenv').config({ override: true });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isDev = process.env.NODE_ENV !== 'production';
+
+// Build CSP directives
+const cspDirectives = {
+    frameAncestors: ["'self'", "http://localhost:3001", "http://localhost:3000"],
+    mediaSrc: ["'self'", "http://localhost:3000", "http://localhost:3001", "data:", "blob:"],
+    connectSrc: ["'self'", "http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"]
+};
+if (isDev) {
+    // Disable HTTPS upgrade in dev to avoid Failed to fetch on http
+    cspDirectives.upgradeInsecureRequests = null;
+}
 
 // Security middleware
 app.use(helmet({
     contentSecurityPolicy: {
-        directives: {
-            frameAncestors: ["'self'", "http://localhost:3001", "http://localhost:3000"],
-            mediaSrc: ["'self'", "http://localhost:3000", "http://localhost:3001", "data:", "blob:"]
-        }
+        useDefaults: true,
+        directives: cspDirectives
     },
     frameguard: {
         action: 'sameorigin'
     },
     crossOriginResourcePolicy: false // Disable CORP for video streaming
 }));
+// Build allowed origins list (support comma-separated FRONTEND_URL env)
+const defaultAllowedOrigins = [
+    'http://localhost:8000',
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:3002',
+    'http://localhost:3003',
+    'http://localhost:3004',
+    'http://localhost:5173',
+    'http://127.0.0.1:3001',
+    'http://127.0.0.1:3003',
+    'null' // allow sandboxed iframes (origin "null") for dev viewers
+];
+const envOrigins = process.env.FRONTEND_URL
+    ? process.env.FRONTEND_URL.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
+const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...envOrigins]));
+
 app.use(cors({
-    origin: process.env.FRONTEND_URL || ['http://localhost:8000', 'http://localhost:3001', 'http://localhost:3002', 'http://localhost:5173'],
+    origin: function(origin, callback) {
+        // Allow requests with no origin (like mobile apps, curl) and same-origin
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        // Special-case for sandboxed iframes which present "null" origin
+        if (origin === 'null' && allowedOrigins.includes('null')) return callback(null, true);
+        return callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
@@ -53,7 +88,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // Serve static files from frontend
-app.use(express.static(path.join(__dirname, '../frontend')));
+app.use(express.static(path.join(__dirname, '../frontend-react/dist')));
 
 // API Routes
 app.use('/api/auth', require('./routes/auth'));
@@ -77,7 +112,7 @@ app.get('/api/health', (req, res) => {
 
 // Serve frontend for all non-API routes
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../frontend/index.html'));
+    res.sendFile(path.join(__dirname, '../frontend-react/dist/index.html'));
 });
 
 // Error handling middleware
@@ -105,7 +140,9 @@ const startServer = async () => {
         // Start the server
         app.listen(PORT, () => {
             console.log(`🚀 Orient LMS Backend Server running on port ${PORT}`);
+            // nodemon reload marker
             console.log(`📱 Frontend served at: http://localhost:${PORT}`);
+            // restart trigger for env updates (CORS origins)
             console.log(`🔗 API endpoints available at: http://localhost:${PORT}/api`);
         });
     } catch (error) {
